@@ -18,7 +18,7 @@ from sklearn.metrics import (
 
 # Two-stage snowfall forecasting model (Conditional regression model) 
 # Stage 1: Classification (XGBoost classifier). Output: probability of snow
-# Stage 2: Regression (How much snow if it snows)? XGBoost regressor. Output: snowfall amount (mm)
+# Stage 2: Regression (How much snow if it snows)? XGBoost regressor. Output: snowfall amount (inches)
 # Using temperature precipitation, snow depth, lag + rolling features
 # lag features (1, 3, 7 days)
 # rolling averages
@@ -27,22 +27,89 @@ from sklearn.metrics import (
 # ---------------------------------
 # 1. Load and clean data
 # ---------------------------------
-df = pd.read_csv("alta_wy.csv", low_memory=False)
+
+# SNOTEL file has metadata/header text before the actual CSV header.
+# Find the line that starts with "Date" so we can skip the description block.
+file_path = "grand_targhee_snotel.csv"
+
+header_row = None
+with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+    for i, line in enumerate(f):
+        if line.startswith("Date,"):
+            header_row = i
+            break
+
+if header_row is None:
+    raise ValueError("Could not find CSV header row starting with 'Date,'")
+
+df = pd.read_csv(file_path, skiprows=header_row, low_memory=False)
+
+# Rename SNOTEL columns to match our pipeline
+df.columns = [
+    "DATE",
+    "SWE",    # Snow Water Equivalent (in)
+    "PREC",   # Precipitation Accumulation (in) - cumulative over water year
+    "TAVG",   # degF
+    "TMAX",   # degF
+    "TMIN",   # degF
+    "SNWD",   # Snow Depth (in)
+]
 
 # Keep only core columns
-df = df[["DATE", "SNOW", "SNWD", "PRCP", "TMAX", "TMIN"]].copy()
+df = df[["DATE", "SWE", "PREC", "SNWD", "TAVG", "TMAX", "TMIN"]].copy()
 
 # Parse and sort dates
 df["DATE"] = pd.to_datetime(df["DATE"])
 df = df.sort_values("DATE").reset_index(drop=True)
 
-# NOAA temperatures are tenths of degree C
-df["TMAX"] = df["TMAX"] / 10.0
-df["TMIN"] = df["TMIN"] / 10.0
+# Convert numeric columns
+for col in ["SWE", "PREC", "SNWD", "TAVG", "TMAX", "TMIN"]:
+    df[col] = pd.to_numeric(df[col], errors="coerce")
 
 # Fill missing values
-df["SNOW"] = df["SNOW"].fillna(0)
-df[["SNWD", "PRCP", "TMAX", "TMIN"]] = df[["SNWD", "PRCP", "TMAX", "TMIN"]].ffill()
+df[["SWE", "PREC", "SNWD"]] = df[["SWE", "PREC", "SNWD"]].ffill()
+df[["TAVG", "TMAX", "TMIN"]] = df[["TAVG", "TMAX", "TMIN"]].ffill()
+
+df = df.dropna().reset_index(drop=True)
+
+# SNOTEL units:
+# SWE, PREC, SNWD are in inches
+# TAVG, TMAX, TMIN are in degrees F
+# Keep snow variables in inches since we want snowfall output in inches
+# Convert temperature to C for freezing logic / snow ratio logic
+df["TAVG"] = (df["TAVG"] - 32) * (5.0 / 9.0)
+df["TMAX"] = (df["TMAX"] - 32) * (5.0 / 9.0)
+df["TMIN"] = (df["TMIN"] - 32) * (5.0 / 9.0)
+
+# Convert cumulative precipitation accumulation into daily precipitation.
+# SNOTEL PREC resets each water year, so negative diffs are reset to 0.
+df["PRCP"] = df["PREC"].diff()
+df["PRCP"] = df["PRCP"].fillna(0)
+df.loc[df["PRCP"] < 0, "PRCP"] = 0
+
+# Use daily positive increase in SWE as snowfall proxy.
+# Negative changes represent melt/settling, so clip them to 0.
+df["SWE_diff_in"] = df["SWE"].diff()
+df["SWE_diff_in"] = df["SWE_diff_in"].fillna(0)
+df.loc[df["SWE_diff_in"] < 0, "SWE_diff_in"] = 0
+
+# Estimate snowfall depth from SWE increase using a temperature-based snow ratio.
+# Colder temperatures -> fluffier snow -> higher snowfall/SWE ratio.
+def snow_ratio(temp_c):
+    if temp_c <= -8:
+        return 15.0
+    elif temp_c <= -4:
+        return 12.0
+    elif temp_c <= 0:
+        return 10.0
+    else:
+        return 8.0
+
+df["snow_ratio"] = df["TAVG"].apply(snow_ratio)
+df["SNOW"] = df["SWE_diff_in"] * df["snow_ratio"]
+
+# Smooth snowfall to reduce noise from SWE + ratio conversion
+df["SNOW"] = df["SNOW"].rolling(2).mean()
 
 df = df.dropna().reset_index(drop=True)
 
@@ -98,7 +165,7 @@ df["doy_cos"] = np.cos(2 * np.pi * df["day_of_year"] / 365.25)
 df["target_snow"] = df["SNOW"].shift(-1)
 
 # Snow/no snow classifier target
-df["target_snow_flag"] = (df["target_snow"] > 5).astype(int)
+df["target_snow_flag"] = (df["target_snow"] > 2).astype(int)
 
 # Drop rows created by shifting, rolling
 df = df.dropna().reset_index(drop=True)
@@ -174,7 +241,7 @@ clf.fit(X_train, y_clf_train)
 
 # Classifier outputs
 y_clf_prob = clf.predict_proba(X_test)[:, 1]
-threshold = 0.72
+threshold = 0.6
 y_clf_pred = (y_clf_prob > threshold).astype(int)
 
 print("\nClassifier metrics:")
@@ -187,8 +254,8 @@ print("Predicted snow days in test set:", int(y_clf_pred.sum()))
 # ---------------------------------
 # 7. Regressor: amount if snow occurs
 # ---------------------------------
-# Only train on meaningful snow days to reduce noise (>5mm)
-snow_mask = y_reg_train > 5
+# Only train on meaningful snow days to reduce noise (>2 inches)
+snow_mask = y_reg_train > 2
 
 X_train_reg = X_train[snow_mask]
 y_train_reg = y_reg_train[snow_mask]
@@ -197,8 +264,8 @@ y_train_reg = y_reg_train[snow_mask]
 y_train_reg_log = np.log1p(y_train_reg)
 
 reg = XGBRegressor(
-    n_estimators=1000, 
-    max_depth=5, 
+    n_estimators=1500, 
+    max_depth=6, 
     learning_rate=0.03,
     subsample=0.8, 
     colsample_bytree=0.8, 
@@ -207,7 +274,9 @@ reg = XGBRegressor(
     random_state=42,
 )
 
-reg.fit(X_train_reg, y_train_reg_log)
+# reg.fit(X_train_reg, y_train_reg_log)
+sample_weight = np.where(y_train_reg > 8, 3, 1)
+reg.fit(X_train_reg, y_train_reg_log, sample_weight=sample_weight)
 # reg.fit(X_train_reg, y_train_reg)
 
 # ---------------------------------
@@ -223,7 +292,7 @@ if len(snow_indices) > 0:
     y_pred_final[snow_indices] = reg_preds
 
 # Small-value clipping
-y_pred_final[y_pred_final < 1.0] = 0.0 # final prediction
+y_pred_final[y_pred_final < 0.1] = 0.0 # final prediction
 
 # ---------------------------------
 # 9. Evaluation
@@ -283,14 +352,13 @@ print("\nSaved predictions to snowfall_predictions_xgb.csv")
 plt.figure(figsize=(8,5))
 plt.hist(df["SNOW"], bins=80, edgecolor="black")
 plt.title("Distribution of Daily Snowfall")
-plt.xlabel("Snowfall (mm)")
+plt.xlabel("Snowfall (inches)")
 plt.ylabel("Frequency")
-plt.xlim(0, 250)
+plt.xlim(0, 30)
 # plt.yscale('log')
 plt.tight_layout()
 plt.savefig("snowfall_histogram.png", dpi=300)
 plt.show()
-
 
 # ---------------------------------
 # 12. Plots
@@ -302,7 +370,7 @@ plt.plot(dates_test.values[:300], y_reg_test.values[:300], label="Actual")
 plt.plot(dates_test.values[:300], y_pred_final[:300], label="Predicted")
 plt.title("Snowfall Prediction (2-stage XGBoost model)")
 plt.xlabel("Date")
-plt.ylabel("Snowfall (mm)")
+plt.ylabel("Snowfall (inches)")
 plt.legend()
 plt.xticks(rotation=45)
 plt.tight_layout()
@@ -315,7 +383,7 @@ plt.plot(dates_test.values, y_reg_test.values, label="Actual")
 plt.plot(dates_test.values, y_pred_final, label="Predicted")
 plt.title("Full Snowfall Prediction (Test Set)")
 plt.xlabel("Date")
-plt.ylabel("Snowfall (mm)")
+plt.ylabel("Snowfall (inches)")
 plt.legend()
 plt.xticks(rotation=45)
 plt.tight_layout()
@@ -324,7 +392,6 @@ plt.show()
 
 # Scatter plot (actual vs. predicted)
 plt.figure(figsize=(7, 7))
-# plt.scatter(y_reg_test, y_pred_final, alpha=0.35)
 plt.scatter(
     y_reg_test,
     y_pred_final,
@@ -332,8 +399,8 @@ plt.scatter(
     cmap="coolwarm",
     alpha=0.5
 )
-plt.xlabel("Actual Snowfall (mm)")
-plt.ylabel("Predicted Snowfall (mm)")
+plt.xlabel("Actual Snowfall (inches)")
+plt.ylabel("Predicted Snowfall (inches)")
 plt.title("Actual vs Predicted Snowfall (colored by magnitude)")
 plt.tight_layout()
 plt.show()
@@ -377,7 +444,6 @@ for t in [0.72, 0.73, 0.74, 0.75, 0.76, 0.77, 0.78]:
     f1 = f1_score(y_clf_test, preds, zero_division=0)
     print(f"Threshold {t}: snow days={preds.sum()}, precision={precision:.3f}, recall={recall:.3f}, f1={f1:.3f}")
 
-
 # ---------------------------------
 # Model Comparison
 # ---------------------------------
@@ -418,7 +484,7 @@ rf_model.fit(X_train, y_reg_train)
 y_pred_rf = rf_model.predict(X_test)
 
 # clip small noise
-y_pred_rf[y_pred_rf < 2] = 0
+y_pred_rf[y_pred_rf < 0.1] = 0
 
 rmse_rf = mean_squared_error(y_reg_test, y_pred_rf) ** 0.5
 mae_rf = mean_absolute_error(y_reg_test, y_pred_rf)
@@ -434,7 +500,6 @@ print("\nXGBoost (2-stage model):")
 print("RMSE:", round(rmse, 4))
 print("MAE :", round(mae, 4))
 
-
 # ---------------------------------
 # Summary table
 # ---------------------------------
@@ -448,17 +513,14 @@ print(f"{'XGBoost (2-stage)':<20} {rmse:<10.2f} {mae:<10.2f}")
 # Average yearly snowfall (inches)
 # ---------------------------------
 
-# Convert mm → inches
-df["SNOW_in"] = df["SNOW"] / 25.4
-
 # Extract year
 df["year"] = df["DATE"].dt.year
 
 # Total snowfall per year
-yearly_totals = df.groupby("year")["SNOW_in"].sum()
+yearly_totals = df.groupby("year")["SNOW"].sum()
 
 # Average across years
 avg_yearly_snow = yearly_totals.mean()
 
-print("\nAverage yearly snowfall (Alta, WY):")
+print("\nAverage yearly snowfall (Grand Targhee SNOTEL estimated snowfall):")
 print(f"{avg_yearly_snow:.2f} inches")
