@@ -241,7 +241,7 @@ clf.fit(X_train, y_clf_train)
 
 # Classifier outputs
 y_clf_prob = clf.predict_proba(X_test)[:, 1]
-threshold = 0.6
+threshold = 0.72
 y_clf_pred = (y_clf_prob > threshold).astype(int)
 
 print("\nClassifier metrics:")
@@ -402,6 +402,7 @@ plt.scatter(
 plt.xlabel("Actual Snowfall (inches)")
 plt.ylabel("Predicted Snowfall (inches)")
 plt.title("Actual vs Predicted Snowfall (colored by magnitude)")
+plt.savefig("actual_vs_predicted_scatter.png", dpi=300) # save scatter plot 
 plt.tight_layout()
 plt.show()
 
@@ -431,6 +432,7 @@ sns.heatmap(
 plt.xlabel("Predicted")
 plt.ylabel("Actual")
 plt.title("Confusion Matrix (Snow vs No Snow)")
+plt.savefig("confusion_matrix.png", dpi=300) # save confusion matrix
 plt.show()
 
 print("Actual snow days in test set:", int(y_clf_test.sum()))
